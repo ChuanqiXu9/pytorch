@@ -892,14 +892,16 @@ def _compile_fx_inner(
             if triton_bundler_meta is not None:
                 cache_info["triton_bundler_meta"] = str(triton_bundler_meta)
             cache_info["time_taken_ns"] = mb_compiled_graph._time_taken_ns
-            log.debug("Saving compiled graph to FX cache with key: %s", cache_key)
-            FxGraphCache._save_graph(
-                cache_key,
-                mb_compiled_graph,
-                example_inputs,
-                local,
-                remote_cache,
-            )
+            # If the compiled graph is not a CompiledFxGraph (e.g, _AsyncOutputCode),
+            # don't write it.
+            if isinstance(mb_compiled_graph, CompiledFxGraph):
+                FxGraphCache._save_graph(
+                    cache_key,
+                    mb_compiled_graph,
+                    example_inputs,
+                    local,
+                    remote_cache,
+                )
 
         # CACHE HIT: not much to really do, just make sure the cache key
         # is recorded on the graph
@@ -908,7 +910,6 @@ def _compile_fx_inner(
             assert mb_compiled_graph is not None
             assert key_info is not None
             (cache_key, debug_lines) = key_info
-            log.debug("FX cache hit with key: %s", cache_key)
             mb_compiled_graph._fx_graph_cache_key = cache_key
             mb_compiled_graph._fx_graph_cache_debug_lines = debug_lines
 

@@ -481,13 +481,12 @@ class _SerializedFxCompile(FxCompile):
                 fake_tensor_mode,
             ).serialize()
             return (input, constants)
-        except (AttributeError, BypassFxGraphCache):
+        except (AttributeError, BypassFxGraphCache) as e:
             # For example: AttributeError: Can't pickle local object
             # 'make_opaque_unary_fn.<locals>.OpaqueUnaryFn'
 
             # TODO: scuba record about not being able to do this?
             log.warning("Unable to pickle input graph or example inputs", exc_info=True)
-
             return None
 
     @abstractmethod

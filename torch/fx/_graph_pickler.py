@@ -433,10 +433,10 @@ class _OpPickleData:
         ],
         options: Options,
     ) -> "_OpPickleData":
-        if (ops_filter := options.ops_filter) and not ops_filter(name):
-            from torch._inductor.codecache import BypassFxGraphCache
+        # if (ops_filter := options.ops_filter) and not ops_filter(name):
+        #     from torch._inductor.codecache import BypassFxGraphCache
 
-            raise BypassFxGraphCache(f"Unable to pickle non-standard op: {name}")
+        #     raise BypassFxGraphCache(f"Unable to pickle non-standard op: {name}")
         return datacls(name)
 
     @abstractmethod

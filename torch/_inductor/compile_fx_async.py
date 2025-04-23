@@ -8,8 +8,11 @@ import torch._inductor.async_compile  # noqa: F401 required to warm up AsyncComp
 from torch._inductor.output_code import CompiledFxGraphConstants, OutputCode
 
 from .compile_fx import _CompileFxKwargs, _InProcessFxCompile, FxCompile
-from .output_code import complex_memory_overlap as complex_memory_overlap  # noqa: F401
+from .output_code import complex_memory_overlap as complex_memory_overlap, MockFXGraphCacheOutput  # noqa: F401
 
+from .fx_passes.post_grad import view_to_reshape
+
+from torch._functorch._aot_autograd.utils import make_boxed_func
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -27,7 +30,6 @@ class _PostCompileData:
     constants: CompiledFxGraphConstants
     graph_kwargs: _CompileFxKwargs
 
-
 # _AsyncOutputCode handles the actual management of waiting for an
 # out-of-process compile to finish and then switching over to it.
 @final
@@ -38,6 +40,7 @@ class _AsyncOutputCode(OutputCode):
     _callback: Callable[[_WireProtocolPickledOutput], OutputCode]
     _post_compile_data: Optional[_PostCompileData] = None
     _boxed_call: bool  # Copied from the forward/output_code
+    _triton_bundle: Any
 
     def __init__(
         self,
@@ -55,6 +58,7 @@ class _AsyncOutputCode(OutputCode):
 
         self._future = future
         self._callback = callback
+        self._triton_bundle = None
 
     @override
     def __call__(self, *args: Any) -> Any:
@@ -81,10 +85,14 @@ class _AsyncOutputCode(OutputCode):
 
         if pcd := self._post_compile_data:
             self._post_compile_data = None
-
+ 
             output_code.post_compile(
                 pcd.example_inputs, pcd.constants, pcd.graph_kwargs
             )
+ 
+        if triton_bundle := self._triton_bundle:
+            output_code.set_triton_bundle(triton_bundle)
+            self._triton_bundle = None
 
         self._output_code = output_code
         self._eager_forward = None
@@ -108,14 +116,19 @@ class _AsyncOutputCode(OutputCode):
         constants: CompiledFxGraphConstants,
         graph_kwargs: _CompileFxKwargs,
     ) -> None:
-        if self._eager_forward is not None:
+        if self._output_code is not None:
+            self._output_code.post_compile(example_inputs, constants, graph_kwargs)
+        elif self._eager_forward is not None:
             self._post_compile_data = _PostCompileData(
                 example_inputs, constants, graph_kwargs
             )
-        else:
-            assert self._output_code is not None
-            self._output_code.post_compile(example_inputs, constants, graph_kwargs)
 
+    @override
+    def set_triton_bundle(self, triton_bundle: Any) -> None:
+        if self._output_code is not None:
+            self._output_code.set_triton_bundle(triton_bundle)
+        else:
+            self._triton_bundle = triton_bundle
 
 # Given an FxCompile for an out-of-process compile _AsyncFxCompile will run
 # eager until the compiled artifact is ready then it will automatically switch
@@ -152,19 +165,36 @@ class _AsyncFxCompile(FxCompile):
         inputs_to_check: Sequence[int],
         graph_kwargs: _CompileFxKwargs,
     ) -> OutputCode:
-        eager_output_code = _InProcessFxCompile().codegen_and_compile(
-            gm, example_inputs, inputs_to_check, graph_kwargs
-        )
-
         # This is similar to _SerializedFxCompile.codegen_and_compile() but
         # handles the async routing.
+
+        # Copied from torch/_inductor/compile_fx.py:_InProcessFxCompile::codegen_and_compile
+        # Convert view to reshape in the graph. This is necessary primarily for
+        # layout optimization. Do it unconditionally for uniformity.
+        #
+        # It's needed because when we do layout optimization, an contiguous tensor
+        # in eager mode may becomes a channels last tensor. A view op previously
+        # can be applied to the contiguous tensor may not be able to be applied
+        # on the channels tensor any more. An error like
+        #   RuntimeError: view size is not compatible with input tensor's size and stride
+        #   (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
+        # will be printed.
+        #
+        # Replace view op to reshape op in this case.
+        # As an example, timm_resnest/botnet26t_256/convnext_base etc. will fail if we don't do this.
+        #
+        # Also this has to be done before FakeTensorProp below to avoid the failed
+        # .view() call.
+        view_to_reshape(gm)
 
         serialized = self._compile.serialize_compile(
             gm, example_inputs, inputs_to_check, graph_kwargs
         )
         if not serialized:
             # We can't serialize - just return the eager OutputCode
-            return eager_output_code
+            return _InProcessFxCompile().codegen_and_compile(
+                gm, example_inputs, inputs_to_check, graph_kwargs
+            )
 
         inputs, constants = serialized
 
@@ -178,4 +208,4 @@ class _AsyncFxCompile(FxCompile):
             self._compile._postprocess(output)
             return output.graph
 
-        return _AsyncOutputCode(eager_output_code, f, callback)
+        return _AsyncOutputCode(MockFXGraphCacheOutput(make_boxed_func(gm)), f, callback)
