@@ -182,6 +182,10 @@ cpp_cache_precompile_headers: bool = not is_fbcode()
 
 online_softmax = os.environ.get("TORCHINDUCTOR_ONLINE_SOFTMAX", "1") == "1"
 
+non_blocking_compile: bool = os.environ.get("TORCHINDUCTOR_NON_BLOCKING_COMPILE", "1") == "1"
+
+_non_blocking_compiling_in_subprocess: bool = False
+
 # dead code elimination
 dce = False
 

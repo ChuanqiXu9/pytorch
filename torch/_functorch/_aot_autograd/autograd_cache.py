@@ -655,6 +655,9 @@ class GenericAOTAutogradCacheEntry(Generic[TForward, TBackward]):
 
     guards_expr: Optional[str]
 
+    backward_state_indices: Optional[list[int]]
+    num_symints_saved_for_bw: Optional[int]
+
     def pre_save(self):
         """
         Perform any preparations to make the cache entry ready for serialization.
@@ -735,6 +738,7 @@ class GenericAOTAutogradCacheEntry(Generic[TForward, TBackward]):
             compiled_bw_func = None
             if self.compiled_bw is not None:
                 compiled_bw_func = self.compiled_bw.load(args)
+                assert compiled_bw_func is not None
                 needs_autograd = True
                 CompileEventLogger.try_add_pt2_compile(
                     "backend_compile", dispatch_mode="autograd"
@@ -757,12 +761,12 @@ class GenericAOTAutogradCacheEntry(Generic[TForward, TBackward]):
                     compiled_bw_func, bw_fx_config
                 )
             else:
+                needs_autograd = False
                 inference_fx_config: _CompileFxKwargs = {
                     **fx_config,
                     "is_backward": False,
                 }
 
-                needs_autograd = False
                 CompileEventLogger.try_add_pt2_compile(
                     "backend_compile", dispatch_mode="inference"
                 )
@@ -805,8 +809,8 @@ class GenericAOTAutogradCacheEntry(Generic[TForward, TBackward]):
                 compiled_fw_func,
                 compiled_bw_func,
                 self.maybe_subclass_meta,
-                self.compiled_bw.num_symints_saved_for_bw_,
-                self.compiled_bw.backward_state_indices,
+                self.num_symints_saved_for_bw,
+                self.backward_state_indices,
                 disable_amp,
                 self.indices_of_inps_to_detach,
                 None,  # lazy_backward_info
@@ -1160,6 +1164,7 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradCacheEntry]):
     @staticmethod
     def _write_to_local_cache(key: str, content: bytes):
         """Write an entry to the local cache."""
+
         subdir = AOTAutogradCache._get_tmp_dir_for_key(key)
         if not os.path.exists(subdir):
             os.makedirs(subdir, exist_ok=True)
@@ -1280,6 +1285,8 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradCacheEntry]):
                 backward_time_taken_ns=backward_time_taken_ns,
                 sanitized_aot_config=sanitized_aot_config,
                 guards_expr=guards_expr,
+                backward_state_indices=backward_state_indices,
+                num_symints_saved_for_bw=num_symints_saved_for_bw,
             )
 
         else:
@@ -1287,7 +1294,6 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradCacheEntry]):
             fw_debug_lines = getattr(
                 compiled_fw_func, "_fx_graph_cache_debug_lines", []
             )
-
             assert fw_key is not None
             compiled_forward = CompiledForward(
                 fx_graph_cache_info=(fw_key, fw_debug_lines),
@@ -1324,4 +1330,6 @@ class AOTAutogradCache(GuardedCache[GenericAOTAutogradCacheEntry]):
                 backward_time_taken_ns=backward_time_taken_ns,
                 sanitized_aot_config=sanitized_aot_config,
                 guards_expr=guards_expr,
+                backward_state_indices=backward_state_indices,
+                num_symints_saved_for_bw=num_symints_saved_for_bw,
             )

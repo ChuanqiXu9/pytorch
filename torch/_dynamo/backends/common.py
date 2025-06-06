@@ -23,11 +23,14 @@ import functools
 import logging
 from unittest.mock import patch
 
+from typing import Callable
+
 import torch
 from torch._dynamo import disable
 from torch._dynamo.exc import TensorifyScalarRestartAnalysis
 from torch._dynamo.utils import counters, defake, flatten_graph_inputs
 from torch._functorch.aot_autograd import (
+    aot_get_config,
     aot_module_simplified,
     SerializableAOTDispatchCompiler,
 )
@@ -36,6 +39,61 @@ from torch.utils._python_dispatch import _disable_current_modes
 
 log = logging.getLogger(__name__)
 
+class wrapped_bw_compiler:
+    bw_compiler_fn: Callable
+
+    def __init__(self, bw_compiler_fn):
+        self.bw_compiler_fn = bw_compiler_fn
+
+    def __call__(self, *args, **kwargs):
+        # stop TorchDynamo from trying to compile our generated backwards pass
+        return disable(
+            disable(
+                self.bw_compiler_fn, reason="do not trace backward compiler function"
+            )(*args, **kwargs),
+            reason="do not trace generated backwards pass",
+        )
+
+def wrap_bw_compiler(bw_compiler_fn):
+    return wrapped_bw_compiler(bw_compiler_fn)
+
+def get_aot_config(gm, example_inputs, **kwargs):
+    # Hack to get around circular import problems with aot_eager_decomp_partition
+    if callable(kwargs.get("decompositions")):
+        kwargs["decompositions"] = kwargs["decompositions"]()
+
+    # NB: dont delete counter increment
+    counters["aot_autograd"]["total"] += 1
+    use_fallback = False
+
+    if use_fallback:
+        log.debug("Unable to use AOT Autograd because graph has mutation")
+        counters["aot_autograd"]["not_ok"] += 1
+        return None
+
+    bw_compiler = kwargs.get("bw_compiler") or kwargs["fw_compiler"]
+
+    if isinstance(bw_compiler, SerializableAOTDispatchCompiler):
+        bw_compiler.compiler_fn = wrap_bw_compiler(bw_compiler.compiler_fn)
+    else:
+        bw_compiler = wrap_bw_compiler(bw_compiler)
+
+    kwargs["bw_compiler"] = bw_compiler
+    kwargs["inference_compiler"] = (
+        kwargs.get("inference_compiler") or kwargs["fw_compiler"]
+    )
+
+    from functorch.compile import nop
+    from torch._inductor.debug import enable_aot_logging
+
+    # debug asserts slow down compile time noticeably,
+    # So only default them on when the aot_eager backend is used.
+    if kwargs.get("fw_compiler", None) == nop:
+        patch_config = patch("functorch.compile.config.debug_assert", True)
+    else:
+        patch_config = contextlib.nullcontext()
+
+    return aot_get_config(gm, example_inputs, **kwargs)
 
 class AotAutograd:
     def __init__(self, **kwargs) -> None:
@@ -65,18 +123,6 @@ class AotAutograd:
             log.debug("Unable to use AOT Autograd because graph has mutation")
             counters["aot_autograd"]["not_ok"] += 1
             return gm
-
-        def wrap_bw_compiler(bw_compiler_fn):
-            def _wrapped_bw_compiler(*args, **kwargs):
-                # stop TorchDynamo from trying to compile our generated backwards pass
-                return disable(
-                    disable(
-                        bw_compiler_fn, reason="do not trace backward compiler function"
-                    )(*args, **kwargs),
-                    reason="do not trace generated backwards pass",
-                )
-
-            return _wrapped_bw_compiler
 
         bw_compiler = self.kwargs.get("bw_compiler") or self.kwargs["fw_compiler"]
 
@@ -115,7 +161,6 @@ class AotAutograd:
 
 def aot_autograd(**kwargs) -> AotAutograd:
     return AotAutograd(**kwargs)
-
 
 def mem_efficient_fusion_kwargs(use_decomps):
     from functorch.compile import (

@@ -3,8 +3,22 @@
 import itertools
 from collections.abc import KeysView, Sequence
 from contextlib import contextmanager, nullcontext
+import contextlib
+import copy
+from dataclasses import dataclass
+import queue
+import dataclasses
+from collections.abc import Generator, Mapping
+import types
+import logging
+import warnings
+import functools
+import sys
+import os
+
 from functools import partial, wraps
-from typing import Any, Callable, NewType, Optional, Protocol, TypeVar
+from typing import Any, Callable, NewType, Optional, Protocol, TypeVar, Union
+from typing_extensions import override, Self, TypeGuard
 from unittest.mock import patch
 
 import torch
@@ -13,6 +27,15 @@ import torch.nn as nn
 import torch.utils._pytree as pytree
 import torch.utils.dlpack
 from torch import Tensor
+
+from torch._inductor.output_code import CompiledFxGraphConstants, CompiledFxGraphConstantsWithGm
+
+from torch._inductor.metrics import CachedMetricsDeltas, CachedMetricsHelper
+from torch import serialization
+from torch._subclasses import FakeTensorMode
+
+from torch.utils._ordered_set import OrderedSet
+
 from torch._decomp.decompositions_for_rng import PhiloxStateTracker, rng_decompositions
 from torch._dispatch.python import enable_python_dispatcher
 from torch._dynamo import compiled_autograd
@@ -23,6 +46,7 @@ from torch._dynamo.utils import (
     set_feature_use,
 )
 from torch._guards import detect_fake_mode
+from torch._inductor.codecache import code_hash, BypassFxGraphCache, FxGraphCache, output_code_log
 from torch._inductor.cudagraph_utils import BoxedDeviceIndex
 from torch._inductor.output_code import OutputCode
 from torch._inductor.utils import BoxedBool, InputType
@@ -40,6 +64,8 @@ static_inputs_log = torch._logging.getArtifactLogger(
 )
 from . import config
 from ._aot_autograd.autograd_cache import (  # noqa: F401
+    sanitize_gm_for_cache,
+    AOTAutogradCacheInfo,
     AOTAutogradCache,
     autograd_cache_key,
     should_use_local_autograd_cache,
@@ -460,13 +486,6 @@ class AOTDispatchCompiler(Protocol):
 
 # TODO: bikeshed on this name
 class SerializableAOTDispatchCompiler(AOTDispatchCompiler):
-    """
-    Represents an AOTDispatchCompiler that returns an OutputCode, and is
-    therefore cacheable. SerializableAOTDispatchCompiler always return an OutputCode.
-    A _CompileFxCallable usually gets converted into an AOTDispatchCompiler after binding all of
-    the kwargs in _CompileFxKwargs.
-    """
-
     def __init__(
         self,
         output_code_ty: type[TOutputCode],
@@ -1082,6 +1101,801 @@ def _try_get_metadata_from_dynamo(
     return aot_autograd_arg_pos_to_source, static_input_indices
 
 
+def _current_fake_mode() -> FakeTensorMode:
+    fake_mode = None
+    if context := torch._guards.TracingContext.try_get():
+        fake_mode = context.fake_mode
+    if fake_mode is not None:
+        return fake_mode
+
+    shape_env = torch.fx.experimental.symbolic_shapes.ShapeEnv()
+    return FakeTensorMode(shape_env=shape_env)
+
+@dataclass
+class _VirtualizedSerializer:
+    """
+    This handles the data for serializing Virtualized.
+    """
+
+    # The values here get serialized. We don't grab everything because some of
+    # the fields can't be serialized.
+    aot_compilation: Any = None
+    choices: Any = None
+    local_buffer_context: Any = None
+    ops: Any = None
+    kernel: Any = None
+    current_node: Any = None
+
+    @classmethod
+    def serialize(cls):
+        """
+        Turn the current state of torch._inductor.virtualized.V into a
+        serializable structure.
+        """
+        from torch._inductor.virtualized import V
+
+        kwargs = {}
+        for f in dataclasses.fields(cls):
+            kwargs[f.name] = getattr(V, f.name)
+        return _VirtualizedSerializer(**kwargs)
+
+    def patch(self):
+        """
+        Returns a context manager which patches the saved values into the
+        current environment. While patched, any value not listed above will be
+        poisoned so that reads will raise an error.
+        """
+        return _VirtualizedSerializerContextManager(self)
+
+
+class _VirtualizedSerializerContextManager(contextlib.ExitStack):
+    """
+    Helper for _VirtualizedSerializer.patch()
+    """
+
+    def __init__(self, virtualized: _VirtualizedSerializer) -> None:
+        super().__init__()
+        self.virtualized = virtualized
+
+    @override
+    def __enter__(self) -> Self:
+        from torch._inductor.virtualized import V
+
+        super().__enter__()
+
+        for set_name in dir(V):
+            if not set_name.startswith("set_"):
+                continue
+            name = set_name[4:]
+            name = name.removesuffix("_handler")
+            set_handler = getattr(V, set_name)
+            if hasattr(self.virtualized, name):
+                value = getattr(self.virtualized, name)
+            else:
+                # poison any values that we don't serialize so that any
+                # unset accesses are caught.
+                value = torch._inductor.virtualized._PoisonedVirtual
+            self.enter_context(set_handler(value))
+
+        return self
+
+
+def _is_fallback_handler(op: object) -> bool:
+    try:
+        return op._is_fallback_handler  # type: ignore[attr-defined]
+    except AttributeError:
+        return False
+
+
+class _LoweringSerializer:
+    """
+    This handles the data for serializing lowering.lowering
+    """
+
+    # A full implementation would make sure that all lowerings are copied over
+    # (or at least detected and raise a bypass when a non-standard lowering is
+    # used). For now we just handle tests by looking for lowerings that were
+    # overridden with a forced fallback.
+    fallbacks: OrderedSet[str]
+
+    def __init__(self) -> None:
+        from torch._inductor import lowering
+
+        self.fallbacks = OrderedSet(
+            str(k) for k, v in lowering.lowerings.items() if _is_fallback_handler(v)
+        )
+
+    def patch(self):
+        return _LoweringSerializerContextManager(self)
+
+
+class _LoweringSerializerContextManager(contextlib.ExitStack):
+    """
+    Helper for _LoweringSerializer.patch()
+    """
+
+    def __init__(self, lowering: _LoweringSerializer) -> None:
+        super().__init__()
+        self.lowering = lowering
+
+    @override
+    def __enter__(self) -> Self:
+        super().__enter__()
+
+        from torch._inductor import lowering
+
+        for k, v in lowering.lowerings.items():
+            name = str(k)
+            if name in self.lowering.fallbacks:
+                if not _is_fallback_handler(v):
+                    self.enter_context(lowering.force_fallback(k))  # type: ignore[arg-type]
+
+        return self
+
+
+@dataclass
+class _FakeTensorModeSerializer:
+    allow_non_fake_inputs: bool
+
+    def __init__(self, fake_mode: FakeTensorMode) -> None:
+        self.allow_non_fake_inputs = fake_mode.allow_non_fake_inputs
+
+    @contextlib.contextmanager
+    def patch(self, fake_mode: FakeTensorMode) -> Generator[None, None, None]:
+        saved_allow_non_fake_inputs = fake_mode.allow_non_fake_inputs
+        fake_mode.allow_non_fake_inputs = self.allow_non_fake_inputs
+
+        yield
+
+        fake_mode.allow_non_fake_inputs = saved_allow_non_fake_inputs
+
+class _LoggerState:
+    """
+    This class is for tracking logging that happens during an out-of-process
+    compile so we can "replay" those messages when the compile is done. Used as
+    a context manager which returns the captured logs (object).
+    """
+
+    loggers: dict[str, int]
+    # The actual log capturing mechanism - this should be None when we're not
+    # actively capturing logs.
+    captured_logs: Any = None
+
+    def __init__(self) -> None:
+        # Mapping from logger name to level.
+        self.loggers = {}
+
+        def filter(
+            logger: Union[logging.Logger, logging.PlaceHolder],
+        ) -> TypeGuard[logging.Logger]:
+            if not isinstance(logger, logging.Logger):
+                # Assume that Placeholders propagate
+                return False
+            # We only want to track torch._inductor logging
+            if not logger.name.startswith("torch._inductor"):
+                return False
+            # If this logger propagates then assume we'll track its parent
+            if logger.propagate:
+                return False
+            return True
+
+        root = logging.getLogger("torch._inductor")
+        if sys.version_info < (3, 12):
+            # logging.getChildren() doesn't exist until 3.12
+            logging._acquireLock()  # type: ignore[attr-defined]
+            try:
+                for logger in root.manager.loggerDict.values():
+                    if filter(logger):
+                        self.loggers[logger.name] = logger.level
+            finally:
+                logging._releaseLock()  # type: ignore[attr-defined]
+        else:
+            q = [root]
+            while q:
+                logger = q.pop()
+                if filter(logger):
+                    self.loggers[logger.name] = logger.level
+                q.extend(logger.getChildren())
+
+    def __enter__(self):
+        assert self.captured_logs is None
+        self.captured_logs = _CapturedLogs(self)
+        self.captured_logs.apply()
+        return self.captured_logs
+
+    def __exit__(
+        self,
+        exc_type: Optional[type[BaseException]],
+        exc_value: Optional[BaseException],
+        traceback: Optional[types.TracebackType],
+    ) -> None:
+        assert self.captured_logs is not None
+        self.captured_logs.remove()
+
+class _CapturedLogs:
+    """
+    Helper for _LoggerState - this class actually attaches to the logger in
+    the child process and grabs the log messages themselves.
+    """
+
+    state: _LoggerState
+    queue: queue.Queue[logging.LogRecord]
+    handlers: Optional[dict[str, logging.Handler]]
+
+    def __init__(self, state: _LoggerState) -> None:
+        self.state = state
+        # A queue of the log entries
+        # TODO: For memory purposes should we log to a file and then respond with that?
+        self.queue = queue.Queue(-1)
+        # Mapping from name to handler (only valid when applied)
+        self.handlers = None
+
+    def finish(self) -> list[logging.LogRecord]:
+        assert self.handlers is None
+        logs = []
+        try:
+            while True:
+                logs.append(self.queue.get_nowait())
+        except queue.Empty:
+            pass
+        return logs
+
+    def remove(self) -> None:
+        assert self.handlers is not None
+        handlers, self.handlers = self.handlers, None
+        for name, handler in handlers.items():
+            logger = logging.getLogger(name)
+            logger.removeHandler(handler)
+
+    def apply(self) -> None:
+        from logging.handlers import QueueHandler
+
+        assert self.handlers is None
+        self.handlers = {}
+        for name, level in self.state.loggers.items():
+            logger = logging.getLogger(name)
+            handler = QueueHandler(self.queue)
+            self.handlers[name] = handler
+            logger.addHandler(handler)
+            if level != logging.NOTSET:
+                logger.setLevel(level)
+
+
+
+@dataclass
+class _WireProtocolInput:
+    """
+    For _SerializedFxCompile - encapsulates all the data being transferred
+    (sent) from the parent to the child.
+    """
+
+    example_inputs: Sequence[InputType]
+    inputs_to_check: Sequence[int]
+    tracing_context: Optional[torch._guards.TracingContext]
+    config: dict[str, object]
+    virtualized: _VirtualizedSerializer
+    deterministic_guard_for_testing: Any # type: ignore[name-defined]  # mypy bug
+    logger_state: _LoggerState
+    lowering: _LoweringSerializer
+    fake_tensor_mode: _FakeTensorModeSerializer
+
+    def serialize(self):
+        """
+        Turns this object into a _WireProtocolPickledInput which can be
+        directly transferred across a stream.
+        """
+        from torch.fx._graph_pickler import GraphPickler
+
+        return _WireProtocolPickledInput(GraphPickler.dumps(self))
+
+@dataclass
+class _WireProtocolPickledInput:
+    value: bytes
+
+    def deserialize(self) -> _WireProtocolInput:
+        """
+        Turn this streamable object back into a _WireProtocolInput.
+        """
+        from torch.fx._graph_pickler import GraphPickler
+
+        fake_mode = _current_fake_mode()
+        result = GraphPickler.loads(self.value, fake_mode)
+        assert isinstance(result, _WireProtocolInput)
+        return result
+
+def serialize_compile(
+    gm: nn.Module,
+    example_inputs: Sequence[InputType],
+    inputs_to_check: Sequence[int],
+) -> Optional[tuple[_WireProtocolPickledInput, CompiledFxGraphConstantsWithGm]]:
+    """
+    Prepare a _WireProtocolInput to compile. If None is returned then it
+    wasn't possible to serialize and we should fallback to in-process.
+    """
+    try:
+        # _check_for_hop raises BypassFxGraphCache when it detects something
+        # we can't cache (or serialize)
+        FxGraphCache._check_for_hop(gm)
+    except BypassFxGraphCache as e:
+        return None
+
+    context = torch._guards.TracingContext.try_get()
+    constants = CompiledFxGraphConstantsWithGm(gm)
+    logger_state = _LoggerState()
+    lowering = _LoweringSerializer()
+
+    # If we're running tests then grab the DeterministicGuard (don't want to
+    # import this if it isn't already imported because it has side-effects)
+    deterministic_guard_for_testing: Optional[  # type: ignore[name-defined]  # mypy bug
+        torch.testing._internal.common_utils.DeterministicGuard
+    ] = None
+    try:
+        deterministic_guard_for_testing = (
+            torch.testing._internal.common_utils.DeterministicGuard._current_state()  # type: ignore[attr-defined]  # mypy bug
+        )
+    except AttributeError:
+        pass
+
+    fake_mode = _current_fake_mode()
+    fake_tensor_mode = _FakeTensorModeSerializer(fake_mode)
+
+    try:
+        input = _WireProtocolInput(
+            # gm,
+            example_inputs,
+            inputs_to_check,
+            context,
+            config.save_config_portable(),
+            _VirtualizedSerializer.serialize(),
+            deterministic_guard_for_testing,
+            logger_state,
+            lowering,
+            fake_tensor_mode,
+        ).serialize()
+        return (input, constants)
+    except (AttributeError, BypassFxGraphCache) as e:
+        # For example: AttributeError: Can't pickle local object
+        # 'make_opaque_unary_fn.<locals>.OpaqueUnaryFn'
+
+        # TODO: scuba record about not being able to do this?
+        log.warning("Unable to pickle input graph or example inputs", exc_info=True)
+        return None
+
+class DispatchAndCompileInput:
+    def __init__(self,
+                 mod,
+                 serialized_fx_input,
+                 fake_flat_args,
+                 params_spec,
+                 params_len,
+                 virtualized,
+                 lowering,
+                 logger_state,
+                 deterministic_guard_for_testing,
+                 tracing_context,
+                 fake_tensor_mode):
+        self.mod = mod
+        self.serialized_fx_input = serialized_fx_input
+        self.fake_flat_args = fake_flat_args
+        self.params_spec = params_spec
+        self.params_len = params_len
+
+        self.virtualized = virtualized
+        self.lowering = lowering
+        self.logger_state = logger_state
+        self.deterministic_guard_for_testing = deterministic_guard_for_testing
+        self.tracing_context = tracing_context
+        self.fake_tensor_mode = fake_tensor_mode
+    
+    def serialize(self):
+        model_path = f"saved_dispatch_model-{count}.pt"
+        serialization.save(self.mod, model_path)
+
+        from torch.fx._graph_pickler import GraphPickler
+        other_bytes = GraphPickler.dumps((
+            self.fake_flat_args,
+            self.params_spec,
+            self.params_len,
+            self.virtualized,
+            self.lowering,
+            self.logger_state,
+            self.deterministic_guard_for_testing,
+            self.tracing_context,
+            self.fake_tensor_mode))
+
+        return PickledCompileInput(
+            model_path,
+            self.serialized_fx_input,
+            other_bytes
+        )
+
+@functools.cache
+def process_pool():
+    from torch._inductor.compile_worker.subproc_pool import SubprocPool, SubprocKind
+    import atexit
+
+    pool = SubprocPool(
+        # TODO: Consider raising this limit if we start using async w/
+        # subprocess and want to compile multiple graphs in parallel.
+        1,
+        kind=SubprocKind.SPAWN,
+    )
+
+    atexit.register(pool.shutdown)
+
+    return pool
+
+def serialize_dispatch_and_compile_input(mod,
+                                         serialized_input,
+                                         fake_flat_args,
+                                         params_spec,
+                                         params_len):
+    try:
+        # _check_for_hop raises BypassFxGraphCache when it detects something
+        # we can't cache (or serialize)
+        FxGraphCache._check_for_hop(mod)
+    except BypassFxGraphCache as e:
+        return None
+
+    context = torch._guards.TracingContext.try_get()
+    constants = CompiledFxGraphConstantsWithGm(mod)
+    logger_state = _LoggerState()
+    lowering = _LoweringSerializer()
+
+    # If we're running tests then grab the DeterministicGuard (don't want to
+    # import this if it isn't already imported because it has side-effects)
+    deterministic_guard_for_testing: Optional[  # type: ignore[name-defined]  # mypy bug
+        torch.testing._internal.common_utils.DeterministicGuard
+    ] = None
+    try:
+        deterministic_guard_for_testing = (
+            torch.testing._internal.common_utils.DeterministicGuard._current_state()  # type: ignore[attr-defined]  # mypy bug
+        )
+    except AttributeError:
+        pass
+
+    fake_mode = _current_fake_mode()
+    fake_tensor_mode = _FakeTensorModeSerializer(fake_mode)
+
+    try:
+        return (DispatchAndCompileInput(
+            mod,
+            serialized_input,
+            fake_flat_args,
+            params_spec,
+            params_len,
+            _VirtualizedSerializer.serialize(),
+            lowering,
+            logger_state,
+            deterministic_guard_for_testing,
+            context,
+            fake_tensor_mode
+        ).serialize(), constants)
+    except (AttributeError, BypassFxGraphCache) as e:
+        raise e
+        # For example: AttributeError: Can't pickle local object
+        # 'make_opaque_unary_fn.<locals>.OpaqueUnaryFn'
+
+        # TODO: scuba record about not being able to do this?
+        warnings.warn(f"Unable to pickle input graph or example inputs {e}")
+        return None
+
+def aot_get_config(mod: nn.Module,
+    args,
+    fw_compiler: AOTDispatchCompiler,
+    bw_compiler: Optional[AOTDispatchCompiler] = None,
+    partition_fn: Callable = default_partition,
+    decompositions: Optional[dict] = None,
+    keep_inference_input_mutations=False,
+    inference_compiler: Optional[AOTDispatchCompiler] = None,
+    cudagraphs: Optional[BoxedBool] = None,
+    boxed_forward_device_index: Optional[BoxedDeviceIndex] = None,
+    ignore_shape_env: bool = False,
+):
+    params = {
+        **dict(mod.named_parameters(remove_duplicate=False)),
+        **dict(mod.named_buffers(remove_duplicate=False)),
+    }
+    params_flat, params_spec = pytree.tree_flatten(params)
+    params_flat = list(params_flat)
+    params_len = len(params_flat)
+
+    if cudagraphs is None:
+        cudagraphs = BoxedBool(torch._inductor.config.triton.cudagraphs)
+
+    if bw_compiler is None:
+        bw_compiler = fw_compiler
+    if inference_compiler is None:
+        inference_compiler = fw_compiler
+
+    full_args = []
+    # First, the params
+    full_args.extend(params_flat)
+
+    if tracing_context := torch._guards.TracingContext.try_get():
+        tracing_context.params_flat = params_flat
+        (
+            tracing_context.params_flat_unwrap_subclasses,
+            tracing_context.params_unwrapped_to_flat_index,
+        ) = unwrap_tensor_subclasses_with_indices_to_original(params_flat)
+
+    # Next, the input args
+    full_args.extend(args)
+
+    (
+        aot_autograd_arg_pos_to_source,
+        static_input_indices,
+    ) = _try_get_metadata_from_dynamo(mod, params.keys(), len(full_args))
+
+    dynamic_shapes = False
+    for x in full_args:
+        if isinstance(x, FakeTensor):
+            dynamic_shapes = x.fake_mode.shape_env is not None
+            break
+
+    aot_config = AOTConfig(
+        fw_compiler=fw_compiler,
+        bw_compiler=bw_compiler,
+        inference_compiler=inference_compiler,
+        partition_fn=partition_fn,
+        decompositions=decompositions,
+        num_params_buffers=params_len,
+        aot_id=next(AOT_COUNTER),
+        keep_inference_input_mutations=keep_inference_input_mutations,
+        dynamic_shapes=dynamic_shapes,
+        aot_autograd_arg_pos_to_source=aot_autograd_arg_pos_to_source,
+        static_input_indices=static_input_indices,
+        is_export=False,
+        no_tangents=False,
+        cache_info=None,
+        ignore_shape_env=ignore_shape_env,
+    )
+    fake_mode, shape_env = construct_fake_mode(full_args, aot_config)
+    fake_flat_args = process_inputs(
+        full_args, aot_config, fake_mode, shape_env, ignore_shape_env
+    )
+
+    return (aot_config, fake_mode, shape_env, fake_flat_args, params_spec,
+            params_len, cudagraphs, boxed_forward_device_index, torch._guards.TracingContext.try_get())
+
+count = 0
+
+@dataclass
+class CompileFxInput:
+    model_: nn.Module
+    example_inputs_: Sequence[InputType]
+    inner_compile: Callable[..., OutputCode]
+    decompositions: Optional[dict] = None
+    ignore_shape_env: bool = False
+
+    def serialize(self):
+        global count
+        count += 1
+        print(f"Serialized Count: {count}")
+        model_path = f"saved_fx_model-{count}.pt"
+
+        serialization.save(self.model_, model_path)
+
+        from torch.fx._graph_pickler import GraphPickler
+        example_inputs__bytes = GraphPickler.dumps(self.example_inputs_)
+        inner_compile_bytes = GraphPickler.dumps(self.inner_compile)
+        decompositions_bytes = GraphPickler.dumps(self.decompositions)
+        ignore_shape_env_bytes = GraphPickler.dumps(self.ignore_shape_env)
+
+        return PickledCompileFxInput(model_path, example_inputs__bytes, inner_compile_bytes, decompositions_bytes, ignore_shape_env_bytes)
+
+@dataclass
+class PickledCompileFxInput:
+    model_path: str
+    example_inputs_bytes: bytes
+    inner_compile_bytes: bytes
+    decompositions_bytes: bytes
+    ignore_shape_env_bytes: bytes
+
+    def deserialize(self):
+        model_ = serialization.load(self.model_path,
+                                    weights_only = False)
+
+        # From https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html#warmstarting-model-using-parameters-from-a-different-model:
+        #   Set dropout and batch normalization layers to evaluation mode before running inference. 
+        model_.eval()
+
+        from torch.fx._graph_pickler import GraphPickler
+        fake_mode = _current_fake_mode()
+        example_inputs = GraphPickler.loads(self.example_inputs_bytes, fake_mode)
+        inner_compile = GraphPickler.loads(self.inner_compile_bytes, fake_mode)
+        decompositions = GraphPickler.loads(self.decompositions_bytes, fake_mode)
+        ignore_shape_env = GraphPickler.loads(self.ignore_shape_env_bytes, fake_mode)
+
+        return CompileFxInput(model_, example_inputs, inner_compile, decompositions, ignore_shape_env)
+
+@dataclass
+class PickledCompileInput:
+    model_path: str
+    serialized_fx_input: PickledCompileFxInput
+    other_inputs_bytes: bytes
+
+    def deserialize(self):
+        model_ = serialization.load(self.model_path,
+                                    weights_only = False)
+
+        # From https://docs.pytorch.org/tutorials/beginner/saving_loading_models.html#warmstarting-model-using-parameters-from-a-different-model:
+        #   Set dropout and batch normalization layers to evaluation mode before running inference. 
+        model_.eval()
+
+        from torch.fx._graph_pickler import GraphPickler
+        fake_mode = _current_fake_mode()
+        fake_flat_args, params_spec, params_len, virtualized, lowering, logger_state, deterministic_guard_for_testing, tracing_context, fake_tensor_mode = GraphPickler.loads(self.other_inputs_bytes, fake_mode)
+
+        return DispatchAndCompileInput(model_,
+                 self.serialized_fx_input,
+                 fake_flat_args,
+                 params_spec,
+                 params_len,
+                 virtualized,
+                 lowering,
+                 logger_state,
+                 deterministic_guard_for_testing,
+                 tracing_context,
+                 fake_tensor_mode)
+
+def _run_in_child(
+    pickled_input: PickledCompileInput,
+    extra_env: Optional[Mapping[str, str]] = None,
+):
+    # Don't use non-blocking compile in child process recursively.
+    torch._inductor.config._non_blocking_compiling_in_subprocess = True
+
+    metrics = CachedMetricsHelper()
+
+    with contextlib.ExitStack() as stack:
+        if extra_env is not None:
+            import unittest
+
+            stack.enter_context(unittest.mock.patch.dict("os.environ", extra_env))
+
+        # Save warnings to "replay" in the parent
+        warning_replay = stack.enter_context(warnings.catch_warnings(record=True))
+
+        # TODO: Should we split the input into multiple sections where each
+        # section sets up state for the previous section? (i.e. a Config section
+        # which we decode and apply, followed by a FakeTensorMode section which
+        # we decode and apply, etc)
+        input = pickled_input.deserialize()
+
+        stack.enter_context(input.virtualized.patch())
+        stack.enter_context(input.lowering.patch())
+
+        captured_logs = stack.enter_context(input.logger_state)
+        # if input.deterministic_guard_for_testing:
+        #     stack.enter_context(input.deterministic_guard_for_testing)
+        # stack.enter_context(torch._guards.tracing(input.tracing_context))
+        # stack.enter_context(DebugContext())
+
+        fxInput = input.serialized_fx_input.deserialize()
+        from torch._inductor.compile_fx import get_compile_config
+        aot_config, fake_mode, shape_env, fake_flat_args, params_spec, params_len,  cudagraphs, boxed_forward_device_index, tracing_context = get_compile_config(fxInput.model_, fxInput.example_inputs_,
+                    fxInput.inner_compile, fxInput.decompositions, fxInput.ignore_shape_env)
+
+        stack.enter_context(torch._guards.tracing(tracing_context))
+        assert tracing_context is not None
+        
+        if tracing_context.fake_mode.shape_env is None:
+            tracing_context.fake_mode.shape_env = ShapeEnv()
+
+        assert _current_fake_mode() == tracing_context.fake_mode
+
+        fake_mode = tracing_context.fake_mode
+        shape_env = tracing_context.fake_mode.shape_env
+
+        from torch._inductor.virtualized import V
+        # stack.enter_context(V.set_fake_mode(fake_mode))
+        stack.enter_context(compiled_autograd._disable())
+        stack.enter_context(torch._functorch.config.patch(unlift_effect_tokens=True))
+
+        # fake_mode = _current_fake_mode()
+        # stack.enter_context(input.fake_tensor_mode.patch(fake_mode))
+
+        # We will try to load into AutogradCache before we start compiling. So if cache info is none,
+        # it implies the cache is disabled, in this case, we tried to enable the cache by a magic
+        # number.
+        if aot_config.cache_info is None:
+            # from torch._inductor.codecache import _filter_backed_symints
+            symints = AOTAutogradCache._filter_backed_symints(input.fake_flat_args)
+            import time
+            aot_config.cache_info = AOTAutogradCacheInfo(
+                "123456789qwertyuioasdfghjkl", time.time_ns(), forward_symints=symints
+            )
+
+        functional_call = create_functional_call(input.mod, input.params_spec, input.params_len)
+        with compiled_autograd._disable():
+            compiled_fn, _ = create_aot_dispatcher_function(
+                functional_call,
+                input.fake_flat_args,
+                aot_config,
+                fake_mode,
+                shape_env,
+            )
+
+    logs = captured_logs.finish()
+
+    return aot_config.cache_info.cache_key, input.serialized_fx_input
+
+class NonBlokcingCompiledFn:
+    def __init__(self, model_: nn.Module, future):
+        self.model_ = model_
+        self._future = future
+        self._compiled_fn = None
+
+    def __call__(self, *args, **kwargs):
+        if self._future is not None and self._future.done():
+            self.switch_compiler()
+
+        if self._compiled_fn is not None:
+            return self._compiled_fn(*args)
+        
+        return self.model_(*args, **kwargs)
+
+    def switch_compiler(self):
+        cache_key, serialized_fx_input = self._future.result()
+
+        fxInput = serialized_fx_input.deserialize()
+        from torch._inductor.compile_fx import get_compile_config
+        aot_config, fake_mode, shape_env, fake_flat_args, params_spec, params_len,  cudagraphs, boxed_forward_device_index, tracing_context = get_compile_config(fxInput.model_, fxInput.example_inputs_,
+                    fxInput.inner_compile, fxInput.decompositions, fxInput.ignore_shape_env)
+        fx_config: _CompileFxKwargs = {
+                "cudagraphs": cudagraphs,
+                "boxed_forward_device_index": boxed_forward_device_index,
+            }
+
+        torch.cuda.empty_cache()
+
+        cache_info: dict[str, Any] = {}
+
+        if tracing_context.fake_mode.shape_env is None:
+            tracing_context.fake_mode.shape_env = ShapeEnv()
+
+        from torch._inductor.virtualized import V
+        with (
+            V.set_fake_mode(fake_mode),
+            torch._guards.tracing(tracing_context),
+            compiled_autograd._disable(),
+            torch._functorch.config.patch(unlift_effect_tokens=True),
+        ):
+            entry = AOTAutogradCache._lookup(cache_key, local = True, remote = should_use_remote_autograd_cache(), 
+                    args = fake_flat_args, cache_info = cache_info)
+            if entry is not None:
+                self._compiled_fn = entry.wrap_post_compile(fake_flat_args, aot_config, fx_config)
+
+        if self._compiled_fn is None:
+            assert False
+
+        self._future = None
+        self.model_ = None
+
+        with open("nonblocking_compiled_fn.txt", "w") as f:
+            print(self._compiled_fn, file = f)
+
+def nonblocking_dispatch_and_compile(
+    mod,
+    serialized_input,
+    fake_flat_args,
+    params_spec,
+    params_len
+):
+    pickled_inputs, constants = serialize_dispatch_and_compile_input(mod,
+        serialized_input, fake_flat_args, params_spec, params_len)
+
+    env_vars = ["TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "CUDA_VISIBLE_DEVICES"]
+    extra_env = {v: os.environ[v] for v in env_vars if v in os.environ}
+
+    from torch._inductor.output_code import MockFXGraphCacheOutput
+    from torch._functorch._aot_autograd.utils import make_boxed_func
+
+    pool = process_pool()
+    return NonBlokcingCompiledFn(MockFXGraphCacheOutput(make_boxed_func(mod)), pool.submit(_run_in_child, pickled_inputs, extra_env))
+
+
 def aot_module_simplified(
     mod: nn.Module,
     args,
@@ -1094,6 +1908,7 @@ def aot_module_simplified(
     cudagraphs: Optional[BoxedBool] = None,
     boxed_forward_device_index: Optional[BoxedDeviceIndex] = None,
     ignore_shape_env: bool = False,
+    serialized_input: PickledCompileFxInput = None,
 ) -> nn.Module:
     """
     This is the simplified or low overhead version of aot_module. For frontends
@@ -1168,7 +1983,19 @@ def aot_module_simplified(
         full_args, aot_config, fake_mode, shape_env, ignore_shape_env
     )
 
+    with open("just_compiled_fn.txt", "a") as f:
+        from datetime import datetime
+        import inspect
+        print(f"At {datetime.now().strftime("%H:%M:%S")}, fake flat args len in orig proc: {len(fake_flat_args)}", file = f)
+
     def dispatch_and_compile():
+        with open("compiling_process.txt", "a") as f:
+            from datetime import datetime
+            print(f"dispatch_and_compile once!", file = f)
+
+        if serialized_input is not None:
+            return nonblocking_dispatch_and_compile(mod, serialized_input, fake_flat_args, params_spec, params_len)
+
         functional_call = create_functional_call(mod, params_spec, params_len)
         with compiled_autograd._disable():
             compiled_fn, _ = create_aot_dispatcher_function(

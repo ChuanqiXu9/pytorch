@@ -255,8 +255,15 @@ def aot_dispatch_base(
         compiled_fw, aot_config, runtime_metadata=fw_metadata
     )
     cache_info = aot_config.cache_info
+    with open("compiling_process.txt", "a") as f:
+        from datetime import datetime
+        print(f"At {datetime.now().strftime("%H:%M:%S")}, is cache info none? {cache_info is None}", file = f)
     if cache_info is not None:
-        if hasattr(compiled_fw, "_fx_graph_cache_key"):
+        with open("compiling_process.txt", "a") as f:
+            from datetime import datetime
+            print(f"At {datetime.now().strftime("%H:%M:%S")}, fwd cache dir: {getattr(compiled_fw, "_fx_graph_cache_key", None)}", file = f)
+
+        if hasattr(compiled_fw, "_fx_graph_cache_key") or torch._inductor.config._non_blocking_compiling_in_subprocess:
             time_taken_ns = time.time_ns() - cache_info.start_time_ns
             guards_expr = AOTAutogradCache.generate_guards_expression(cache_info)
             entry = AOTAutogradCache.make_entry(
@@ -280,6 +287,10 @@ def aot_dispatch_base(
             AOTAutogradCache.save(
                 cache_info.cache_key, entry, remote=should_use_remote_autograd_cache()
             )
+
+            with open("compiling_process.txt", "a") as f:
+                from datetime import datetime
+                print(f"Saved at {datetime.now().strftime("%H:%M:%S")}", file = f)
 
     compiled_fw = fakified_out_wrapper.post_compile(
         compiled_fw,
@@ -1678,7 +1689,7 @@ def aot_dispatch_autograd(
                     placeholder_list[i] = ph_arg.as_strided(ph_arg.size(), real_stride)
 
             compiled_bw_func = None
-            if num_symints_saved_for_bw > 0:
+            if num_symints_saved_for_bw > 0 or True:
                 try:
                     # See Note: [Backward graph lazy lowering]
                     with torch._subclasses.fake_tensor.unset_fake_temporarily():

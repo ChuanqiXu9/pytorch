@@ -966,6 +966,7 @@ class GuardedCache(Generic[T]):
     ) -> Generator[tuple[T, bytes], None, None]:
         if local:
             subdir = cls._get_tmp_dir_for_key(key)
+
             if os.path.exists(subdir):
                 for path in sorted(os.listdir(subdir)):
                     try:
@@ -1127,7 +1128,8 @@ class FxGraphCache(GuardedCache[CompiledFxGraph]):
         """
         Return the disk location for a given cache key.
         """
-        return os.path.join(FxGraphCache._get_tmp_dir(), key[1:3], key)
+        return os.path.join("/home/chuanqi.xcq/open_clip/cache_dir", key[1:3], key)
+        # return os.path.join(FxGraphCache._get_tmp_dir(), key[1:3], key)
 
     @staticmethod
     def cache_hit_post_compile(
@@ -1412,10 +1414,11 @@ class FxGraphCache(GuardedCache[CompiledFxGraph]):
         I personally believe it is more annoying/difficult to read in that format.
         """
         try:
-            FxGraphCache._check_can_cache(gm)
+            # FxGraphCache._check_can_cache(gm)
             key, debug_lines = compiled_fx_graph_hash(
                 gm, example_inputs, fx_kwargs, inputs_to_check
             )
+
         except BypassFxGraphCache as e:
             counters["inductor"]["fxgraph_cache_bypass"] += 1
             log.info("Bypassing FX Graph Cache because '%s'", e)
